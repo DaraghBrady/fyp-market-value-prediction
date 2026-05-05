@@ -1,0 +1,1263 @@
+"""
+Football Player Market Value Analysis Streamlit Dashboard
+Final Year Dissertation Project
+"""
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import unicodedata, re, os
+
+
+# CONFIG
+st.set_page_config(
+    page_title="Football Market Value Analysis",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# Colour scheme
+LEAGUE_COLORS = {
+    "Premier League":"#8e44ad",
+    "La Liga":"#e67e22",
+    "Bundesliga":"#e74c3c",
+    "Serie A":"#00bcd4",
+    "Ligue 1":"#2980b9",
+}
+POS_COLORS = {
+    "GK": "#2ecc71",
+    "DF": "#3498db",
+    "MF": "#9b59b6",
+    "FW": "#e74c3c",
+}
+SEASONS = ["2020-2021", "2021-2022", "2022-2023", "2023-2024", "2024-2025"]
+SEASON_LABELS = {"2020-2021": "20/21", "2021-2022": "21/22",
+                 "2022-2023": "22/23", "2023-2024": "23/24", "2024-2025": "24/25"}
+LEAGUES = ["Premier League", "La Liga", "Bundesliga", "Serie A", "Ligue 1"]
+POSITIONS = ["GK", "DF", "MF", "FW"]
+
+
+# DATA LOADING (cached)
+@st.cache_data
+def load_data():
+    base = os.path.dirname(__file__)
+    path = os.path.join(base, "..", "data", "processed", "app_data.csv")
+    df = pd.read_csv(path, low_memory=False)
+    df["mv_M"] = df["market_value_end"] / 1e6
+    df["season_label"] = df["season"].map(SEASON_LABELS)
+    # Impute rating per position
+    df["rating_imp"] = df["rating"].copy()
+    for p in df["pos_enc"].dropna().unique():
+        mask = df["pos_enc"] == p
+        med  = df.loc[mask, "rating"].median()
+        df.loc[mask & df["rating"].isna(), "rating_imp"] = med
+    df["rating_imp"] = df["rating_imp"].fillna(df["rating"].median())
+    # Age squared
+    df["age_sq"] = df["Age"] ** 2
+    # League encoding for estimator model
+    league_map = {lg: i for i, lg in enumerate(["Premier League", "La Liga", "Bundesliga", "Serie A", "Ligue 1"])}
+    df["league_enc"] = df["league"].map(league_map)
+    return df
+
+df = load_data()
+
+# SIDEBAR NAVIGATION
+st.sidebar.title("Market Value Analysis")
+st.sidebar.markdown("---")
+page = st.sidebar.radio(
+    "Navigate to",
+    ["Overview", "League Comparison", "Position Comparison",
+     "Season Trends", "Player Profile", "Market Value Insights",
+     "Value Estimator"],
+    label_visibility="collapsed",
+)
+st.sidebar.markdown("---")
+st.sidebar.caption("Big 5 European Leagues · 2020-2025")
+
+# HELPER FUNCTIONS
+def fmt_euros(v):
+    if pd.isna(v): return "N/A"
+    if v >= 1e6:  return f"€{v/1e6:.1f}M"
+    if v >= 1e3:  return f"€{v/1e3:.0f}K"
+    return f"€{v:.0f}"
+
+def player_photo(url, width=140):
+    if pd.isna(url) or not isinstance(url, str):
+        st.markdown(
+            f'<div style="width:{width}px;height:{width}px;background:#2a2a2a;'
+            f'border-radius:50%;display:flex;align-items:center;justify-content:center;'
+            f'font-size:48px;">👤</div>', unsafe_allow_html=True)
+    else:
+        st.image(url, width=width)
+
+def cosine_similarity_matrix(A, B):
+    """Cosine similarity: rows of A vs rows of B (both 2-D)."""
+    A_n = A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-9)
+    B_n = B / (np.linalg.norm(B, axis=1, keepdims=True) + 1e-9)
+    return A_n @ B_n.T
+
+SIM_FEATS = ["Age", "Gls_90", "Ast_90", "G+A_90", "xG90", "xA90",
+             "xGChain90", "xGBuildup90", "rating_imp", "minutes",
+             "team_finishing_pos"]
+
+def find_similar_players(df_pool, player_idx, top_n=5, same_pos=True):
+    """Return top_n most similar players to df_pool.loc[player_idx]."""
+    pool = df_pool.copy().reset_index(drop=True)
+    feats = [f for f in SIM_FEATS if f in pool.columns]
+    pool[feats] = pool[feats].fillna(pool[feats].mean())
+    if same_pos:
+        pos = pool.loc[player_idx, "pos_label"]
+        pool = pool[pool["pos_label"] == pos].copy().reset_index(drop=True)
+        # Recompute player_idx after filter
+        name_match = pool.loc[pool["name"] == df_pool.loc[player_idx, "name"]].index
+        if len(name_match) == 0:
+            return pd.DataFrame()
+        player_idx = name_match[0]
+    X = pool[feats].values.astype(float)
+    mu = X.mean(0); sig = X.std(0) + 1e-9
+    X_s = (X - mu) / sig
+    sims = cosine_similarity_matrix(X_s[player_idx:player_idx+1], X_s)[0]
+    sims[player_idx] = -1  # exclude self
+    top_idx = np.argsort(sims)[::-1][:top_n]
+    result = pool.iloc[top_idx][["name", "club", "league", "season", "pos_label",
+                                  "Age", "goals", "assists", "rating_imp",
+                                  "market_value_end", "image_url"]].copy()
+    result["Similarity"] = sims[top_idx]
+    result["Market Value"] = result["market_value_end"].apply(fmt_euros)
+    return result
+
+# ESTIMATOR MODEL (trained once, cached)
+ESTIMATOR_FEATS = [
+    "Age", "age_sq", "pos_enc", "league_enc",
+    "Gls_90", "Ast_90", "xG90", "xA90", "xGChain90", "xGBuildup90",
+    "rating_imp", "minutes", "appearances", "team_finishing_pos",
+]
+
+@st.cache_data
+def train_value_estimator(data_hash):
+    """
+    Fit a Ridge regression (with intercept) on the full dataset.
+    Returns weights, normalisation params, and training RMSE.
+    data_hash is a dummy arg so the cache key changes if data changes.
+    """
+    src = df.copy()
+    for c in ESTIMATOR_FEATS:
+        if c in src.columns:
+            src[c] = src[c].fillna(src[c].median())
+    mask = src["log_mv"].notna() & src[ESTIMATOR_FEATS].notna().all(axis=1)
+    X = src.loc[mask, ESTIMATOR_FEATS].values.astype(float)
+    y = src.loc[mask, "log_mv"].values.astype(float)
+    mu  = X.mean(0)
+    sig = X.std(0) + 1e-9
+    Xn  = (X - mu) / sig
+    Xb  = np.c_[np.ones(len(Xn)), Xn]
+    lam = 10.0
+    I   = np.eye(Xb.shape[1])
+    I[0, 0] = 0
+    w   = np.linalg.solve(Xb.T @ Xb + lam * I, Xb.T @ y)
+    rmse = float(np.sqrt(np.mean((Xb @ w - y) ** 2)))
+    return w, mu, sig, rmse
+
+_w, _mu, _sig, _rmse = train_value_estimator(len(df))
+
+
+# PAGE 1: OVERVIEW
+if page == "Overview":
+    st.title("Football Player Market Value Analysis by Daragh Brady")
+    st.markdown(
+        "Predicting and understanding what drives player market value across the "
+        "**Big 5 European football leagues** using in-season performance statistics. "
+        "Models include OLS Regression, Ridge Regression, and Random Forest, "
+        "all implemented from scratch using NumPy."
+    )
+    st.markdown("---")
+
+    # KPI row — always visible
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Total Players", f"{df['name'].nunique():,}")
+    col2.metric("Season Records", f"{len(df):,}")
+    col3.metric("Leagues", "5")
+    col4.metric("Seasons", "5")
+    col5.metric("Avg Market Value", fmt_euros(df["market_value_end"].mean()))
+
+    with st.expander("Market Value Distributions", expanded=True):
+        col_l, col_r = st.columns(2)
+
+        with col_l:
+            st.subheader("Market Value Distribution by League")
+            fig = px.box(
+                df.dropna(subset=["mv_M"]),
+                x="league", y="mv_M", color="league",
+                color_discrete_map=LEAGUE_COLORS,
+                labels={"mv_M": "Market Value (€M)", "league": ""},
+                category_orders={"league": LEAGUES},
+                points="outliers",
+                hover_data={"name": True, "season_label": True, "mv_M": ":.2f", "league": False},
+            )
+            fig.update_traces(showlegend=False)
+            fig.update_layout(height=380, margin=dict(t=20, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+
+        with col_r:
+            st.subheader("Average Market Value by Season")
+            mv_season = (df.groupby(["season_label", "league"])["mv_M"]
+                         .mean().reset_index())
+            season_order = list(SEASON_LABELS.values())
+            fig2 = px.line(
+                mv_season, x="season_label", y="mv_M", color="league",
+                color_discrete_map=LEAGUE_COLORS, markers=True,
+                labels={"mv_M": "Avg Market Value (€M)", "season_label": "Season", "league": "League"},
+                category_orders={"season_label": season_order, "league": LEAGUES},
+            )
+            fig2.update_layout(height=380, margin=dict(t=20, b=0),
+                               legend=dict(orientation="h", y=-0.2))
+            st.plotly_chart(fig2, use_container_width=True)
+
+    with st.expander("Position Breakdown", expanded=False):
+        col_a, col_b, col_c = st.columns(3)
+
+        with col_a:
+            pos_count = df.groupby("pos_label").size().reset_index(name="count")
+            fig3 = px.pie(pos_count, names="pos_label", values="count",
+                          color="pos_label", color_discrete_map=POS_COLORS,
+                          hole=0.45, title="Records by Position")
+            fig3.update_layout(height=300, margin=dict(t=40, b=0), showlegend=True)
+            st.plotly_chart(fig3, use_container_width=True)
+
+        with col_b:
+            pos_mv = df.dropna(subset=["mv_M"]).groupby("pos_label")["mv_M"].median().reset_index()
+            fig4 = px.bar(pos_mv, x="pos_label", y="mv_M", color="pos_label",
+                          color_discrete_map=POS_COLORS,
+                          labels={"mv_M": "Median MV (€M)", "pos_label": "Position"},
+                          title="Median Market Value by Position",
+                          category_orders={"pos_label": POSITIONS})
+            fig4.update_traces(showlegend=False)
+            fig4.update_layout(height=300, margin=dict(t=40, b=0))
+            st.plotly_chart(fig4, use_container_width=True)
+
+        with col_c:
+            top10 = (df.groupby("name")["market_value_end"].max()
+                       .sort_values(ascending=False).head(10).reset_index())
+            top10["mv_M"] = top10["market_value_end"] / 1e6
+            top10 = top10.merge(df[["name","pos_label"]].drop_duplicates("name"), on="name", how="left")
+            fig5 = px.bar(top10, x="mv_M", y="name", orientation="h",
+                          color="pos_label", color_discrete_map=POS_COLORS,
+                          labels={"mv_M": "Peak Market Value (€M)", "name": ""},
+                          title="Top 10 Players by Peak Market Value")
+            fig5.update_layout(height=300, margin=dict(t=40, b=0, l=0),
+                               yaxis=dict(autorange="reversed"), showlegend=False)
+            st.plotly_chart(fig5, use_container_width=True)
+
+
+# PAGE 2: LEAGUE COMPARISON
+elif page == "League Comparison":
+    st.title("League Comparison")
+
+    col_f1, col_f2 = st.columns([2, 2])
+    with col_f1:
+        sel_seasons = st.multiselect("Seasons", SEASONS,
+                                      default=SEASONS,
+                                      format_func=lambda s: SEASON_LABELS[s])
+    with col_f2:
+        sel_pos = st.multiselect("Positions", POSITIONS, default=POSITIONS)
+
+    if not sel_seasons or not sel_pos:
+        st.warning("Please select at least one season and one position.")
+        st.stop()
+
+    sub = df[df["season"].isin(sel_seasons) & df["pos_label"].isin(sel_pos)]
+    st.markdown(f"**{len(sub):,} player-season records** in selection")
+
+    with st.expander("Key Performance Stats", expanded=True):
+        stat_choice = st.selectbox(
+            "Statistic",
+            ["goals", "assists", "G+A", "Gls_90", "Ast_90", "xG90",
+             "xA90", "xGChain90", "rating_imp", "appearances", "minutes"],
+            format_func=lambda x: {
+                "goals": "Goals", "assists": "Assists", "G+A": "Goals + Assists",
+                "Gls_90": "Goals / 90", "Ast_90": "Assists / 90",
+                "xG90": "xG / 90", "xA90": "xA / 90",
+                "xGChain90": "xG Chain / 90", "rating_imp": "Player Rating",
+                "appearances": "Appearances", "minutes": "Minutes Played",
+            }.get(x, x),
+        )
+        stat_agg = sub.groupby("league")[stat_choice].mean().reset_index()
+        stat_agg.columns = ["League", "Value"]
+        stat_agg = stat_agg.sort_values("Value", ascending=False)
+        fig2 = px.bar(stat_agg, x="League", y="Value", color="League",
+                      color_discrete_map=LEAGUE_COLORS,
+                      labels={"Value": f"Avg {stat_choice}"},
+                      category_orders={"League": LEAGUES})
+        fig2.update_traces(showlegend=False)
+        fig2.update_layout(height=380, margin=dict(t=10, b=0))
+        st.plotly_chart(fig2, use_container_width=True)
+
+    with st.expander("Age Profile by League", expanded=False):
+        fig3 = px.histogram(
+            sub.dropna(subset=["Age"]), x="Age", color="league",
+            color_discrete_map=LEAGUE_COLORS, barmode="overlay",
+            opacity=0.65, nbins=25,
+            labels={"Age": "Player Age", "league": "League"},
+            category_orders={"league": LEAGUES},
+        )
+        fig3.update_layout(height=360, margin=dict(t=10, b=0),
+                           legend=dict(orientation="h", y=-0.2))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    with st.expander("xG vs Market Value by League", expanded=False):
+        scatter = (sub.dropna(subset=["xG90", "mv_M"])
+                     [sub["xG90"] <= 3]
+                     .sample(min(1500, len(sub[sub["xG90"] <= 3].dropna(subset=["xG90", "mv_M"]))), random_state=42))
+        fig4 = px.scatter(
+            scatter, x="xG90", y="mv_M", color="league",
+            color_discrete_map=LEAGUE_COLORS, opacity=0.55,
+            hover_data=["name", "season_label"],
+            labels={"xG90": "xG per 90", "mv_M": "Market Value (€M)", "league": "League"},
+            trendline="ols",
+            category_orders={"league": LEAGUES},
+        )
+        fig4.update_layout(height=360, margin=dict(t=10, b=0),
+                           legend=dict(orientation="h", y=-0.2))
+        st.plotly_chart(fig4, use_container_width=True)
+
+    with st.expander("Top 10 Players by League", expanded=False):
+        league_tabs = st.tabs(LEAGUES)
+        for tab, lg in zip(league_tabs, LEAGUES):
+            with tab:
+                top_lg = (sub[sub["league"] == lg]
+                          .sort_values("market_value_end", ascending=False)
+                          .drop_duplicates("name")
+                          .head(10)[["name", "pos_label", "club", "season_label",
+                                      "Age", "goals", "assists", "rating_imp", "mv_M"]]
+                          .rename(columns={"name": "Player", "pos_label": "Pos",
+                                           "club": "Club", "season_label": "Season",
+                                           "Age": "Age", "goals": "Goals",
+                                           "assists": "Assists", "rating_imp": "Rating",
+                                           "mv_M": "Market Value (€M)"}))
+                top_lg["Market Value (€M)"] = top_lg["Market Value (€M)"].round(1)
+                top_lg["Rating"] = top_lg["Rating"].round(2)
+                st.dataframe(top_lg.reset_index(drop=True), hide_index=True)
+
+
+# PAGE 3: POSITION COMPARISON
+elif page == "Position Comparison":
+    st.title("Position Comparison")
+
+    col_f1, col_f2 = st.columns(2)
+    with col_f1:
+        sel_leagues = st.multiselect("Leagues", LEAGUES, default=LEAGUES)
+    with col_f2:
+        sel_seasons2 = st.multiselect("Seasons", SEASONS, default=SEASONS,
+                                       format_func=lambda s: SEASON_LABELS[s])
+
+    if not sel_leagues or not sel_seasons2:
+        st.warning("Please select at least one league and one season.")
+        st.stop()
+
+    sub2 = df[df["league"].isin(sel_leagues) & df["season"].isin(sel_seasons2)]
+    st.markdown(f"**{len(sub2):,} player-season records** in selection")
+
+    with st.expander("Market Value & Position Profile", expanded=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Market Value by Position")
+            fig = px.box(
+                sub2.dropna(subset=["mv_M"]), x="pos_label", y="mv_M",
+                color="pos_label", color_discrete_map=POS_COLORS,
+                labels={"mv_M": "Market Value (€M)", "pos_label": "Position"},
+                category_orders={"pos_label": POSITIONS},
+                points="outliers",
+                hover_data={"name": True, "season_label": True, "mv_M": ":.2f", "pos_label": False},
+            )
+            fig.update_traces(showlegend=False)
+            fig.update_layout(height=370, margin=dict(t=10, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+
+        with col2:
+            st.subheader("Average Stats by Position")
+            stats_to_show = ["goals", "assists", "xG90", "xA90", "xGBuildup90",
+                             "Gls_90", "Ast_90", "rating_imp"]
+            pos_stats = sub2.groupby("pos_label")[stats_to_show].mean().reset_index()
+            # Normalise 0–1 for radar
+            pos_stats_n = pos_stats.copy()
+            for c in stats_to_show:
+                mn = pos_stats[c].min(); mx = pos_stats[c].max()
+                pos_stats_n[c] = (pos_stats[c] - mn) / max(mx - mn, 1e-9)
+            stat_labels = ["Goals", "Assists", "xG/90", "xA/90",
+                           "xG Buildup/90", "Gls/90", "Ast/90", "Rating"]
+            fig2 = go.Figure()
+            for _, row in pos_stats_n.iterrows():
+                pos = row["pos_label"]
+                vals = [row[s] for s in stats_to_show]
+                fig2.add_trace(go.Scatterpolar(
+                    r=vals + [vals[0]], theta=stat_labels + [stat_labels[0]],
+                    fill="toself", name=pos,
+                    line=dict(color=POS_COLORS.get(pos, "grey")),
+                ))
+            fig2.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
+                               height=370, margin=dict(t=10, b=0),
+                               legend=dict(orientation="h", y=-0.1))
+            st.plotly_chart(fig2, use_container_width=True)
+
+    with st.expander("Rating Distribution by Position", expanded=False):
+        fig3 = px.violin(
+            sub2.dropna(subset=["rating_imp"]), x="pos_label", y="rating_imp",
+            color="pos_label", color_discrete_map=POS_COLORS, box=True,
+            points="outliers",
+            hover_data={"name": True, "season_label": True, "rating_imp": ":.2f", "pos_label": False},
+            labels={"rating_imp": "Player Rating", "pos_label": "Position"},
+            category_orders={"pos_label": POSITIONS},
+        )
+        fig3.update_traces(showlegend=False)
+        fig3.update_layout(height=380, margin=dict(t=10, b=0))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    with st.expander("Age vs Market Value by Position", expanded=False):
+        scatter2 = sub2.dropna(subset=["Age", "mv_M"]).sample(min(2000, len(sub2)), random_state=7)
+        fig4 = px.scatter(
+            scatter2, x="Age", y="mv_M", color="pos_label",
+            color_discrete_map=POS_COLORS, opacity=0.5,
+            hover_data=["name", "league", "season_label"],
+            labels={"Age": "Age", "mv_M": "Market Value (€M)", "pos_label": "Position"},
+            trendline="lowess",
+            category_orders={"pos_label": POSITIONS},
+        )
+        fig4.update_layout(height=380, margin=dict(t=10, b=0),
+                           legend=dict(orientation="h", y=-0.2))
+        st.plotly_chart(fig4, use_container_width=True)
+
+    with st.expander("GK & Defender Defensive Stats", expanded=False):
+        col5, col6 = st.columns(2)
+        with col5:
+            gk_data = sub2[sub2["pos_label"] == "GK"].dropna(subset=["gk_clean_sheet_pct", "mv_M"])
+            if len(gk_data) > 10:
+                fig5 = px.scatter(gk_data, x="gk_clean_sheet_pct", y="mv_M",
+                                  color_discrete_sequence=[POS_COLORS["GK"]], opacity=0.6,
+                                  hover_data=["name", "season_label", "club"],
+                                  trendline="ols",
+                                  labels={"gk_clean_sheet_pct": "Clean Sheet %",
+                                          "mv_M": "Market Value (€M)"},
+                                  title="GK: Clean Sheet % vs Market Value")
+                fig5.update_layout(height=320, margin=dict(t=40, b=0))
+                st.plotly_chart(fig5, use_container_width=True)
+            else:
+                st.info("Not enough GK data for selected filters.")
+
+        with col6:
+            def_data = sub2[sub2["pos_label"] == "DF"].dropna(subset=["def_goals_conceded_per90", "mv_M"])
+            if len(def_data) > 10:
+                fig6 = px.scatter(def_data, x="def_goals_conceded_per90", y="mv_M",
+                                  color_discrete_sequence=[POS_COLORS["DF"]], opacity=0.6,
+                                  hover_data=["name", "season_label", "club"],
+                                  trendline="ols",
+                                  labels={"def_goals_conceded_per90": "Goals Conceded / 90",
+                                          "mv_M": "Market Value (€M)"},
+                                  title="Defender: Goals Conceded / 90 vs Market Value")
+                fig6.update_layout(height=320, margin=dict(t=40, b=0))
+                st.plotly_chart(fig6, use_container_width=True)
+            else:
+                st.info("Not enough Defender data for selected filters.")
+
+
+# PAGE 4: SEASON TRENDS (YEAR-ON-YEAR)
+elif page == "Season Trends":
+    st.title("Season Trends (Year-on-Year)")
+
+    col_f1, col_f2 = st.columns(2)
+    with col_f1:
+        sel_lg_yoy = st.multiselect("Leagues", LEAGUES, default=LEAGUES)
+    with col_f2:
+        sel_pos_yoy = st.multiselect("Positions", POSITIONS, default=POSITIONS)
+
+    if not sel_lg_yoy or not sel_pos_yoy:
+        st.warning("Please select at least one league and one position.")
+        st.stop()
+
+    sub3 = df[df["league"].isin(sel_lg_yoy) & df["pos_label"].isin(sel_pos_yoy)]
+    season_order = list(SEASON_LABELS.values())
+
+    with st.expander("Market Value Trends", expanded=True):
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.subheader("Median Market Value over Time")
+            mv_trend = (sub3.groupby(["season_label", "league"])["mv_M"]
+                        .median().reset_index())
+            fig = px.line(mv_trend, x="season_label", y="mv_M", color="league",
+                          color_discrete_map=LEAGUE_COLORS, markers=True,
+                          labels={"mv_M": "Median Market Value (€M)",
+                                  "season_label": "Season", "league": "League"},
+                          category_orders={"season_label": season_order, "league": LEAGUES})
+            fig.update_layout(height=370, margin=dict(t=10, b=0),
+                              legend=dict(orientation="h", y=-0.25))
+            st.plotly_chart(fig, use_container_width=True)
+
+        with col2:
+            st.subheader("Year-on-Year % Change in Median Market Value")
+            yoy_list = []
+            for lg in sel_lg_yoy:
+                sub_lg = (sub3[sub3["league"] == lg]
+                          .groupby("season")["market_value_end"].median()
+                          .reindex(SEASONS).reset_index())
+                sub_lg.columns = ["season", "med_mv"]
+                for i in range(1, len(sub_lg)):
+                    prev = sub_lg.loc[i-1, "med_mv"]
+                    curr = sub_lg.loc[i, "med_mv"]
+                    if pd.notna(prev) and pd.notna(curr) and prev > 0:
+                        label = f"{SEASON_LABELS[sub_lg.loc[i-1,'season']]}→{SEASON_LABELS[sub_lg.loc[i,'season']]}"
+                        yoy_list.append({"League": lg, "Transition": label,
+                                         "Change (%)": (curr - prev) / prev * 100})
+            yoy_df = pd.DataFrame(yoy_list)
+            if len(yoy_df):
+                fig2 = px.bar(yoy_df, x="Transition", y="Change (%)", color="League",
+                              color_discrete_map=LEAGUE_COLORS, barmode="group",
+                              labels={"Change (%)": "YoY Change (%)", "Transition": ""},
+                              category_orders={"League": LEAGUES})
+                fig2.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.4)
+                fig2.update_layout(height=370, margin=dict(t=10, b=0),
+                                   legend=dict(orientation="h", y=-0.25))
+                st.plotly_chart(fig2, use_container_width=True)
+
+    with st.expander("Statistical Trends", expanded=False):
+        col3, col4 = st.columns(2)
+
+        with col3:
+            st.subheader("Stat Trend over Seasons")
+            trend_stat = st.selectbox(
+                "Choose statistic",
+                ["goals", "assists", "xG90", "xA90", "Gls_90", "rating_imp",
+                 "appearances", "minutes", "team_finishing_pos"],
+                format_func=lambda x: {
+                    "goals": "Goals (avg)", "assists": "Assists (avg)",
+                    "xG90": "xG / 90 (avg)", "xA90": "xA / 90 (avg)",
+                    "Gls_90": "Goals / 90 (avg)", "rating_imp": "Player Rating (avg)",
+                    "appearances": "Appearances (avg)", "minutes": "Minutes Played (avg)",
+                    "team_finishing_pos": "Team Finishing Position (avg)",
+                }.get(x, x),
+            )
+            stat_trend = (sub3.groupby(["season_label", "league"])[trend_stat]
+                          .mean().reset_index())
+            fig3 = px.line(stat_trend, x="season_label", y=trend_stat, color="league",
+                           color_discrete_map=LEAGUE_COLORS, markers=True,
+                           labels={trend_stat: f"Avg {trend_stat}",
+                                   "season_label": "Season", "league": "League"},
+                           category_orders={"season_label": season_order, "league": LEAGUES})
+            fig3.update_layout(height=340, margin=dict(t=10, b=0),
+                               legend=dict(orientation="h", y=-0.3))
+            st.plotly_chart(fig3, use_container_width=True)
+
+        with col4:
+            st.subheader("Market Value by Position: Year-on-Year")
+            mv_pos_time = (sub3.groupby(["season_label", "pos_label"])["mv_M"]
+                           .median().reset_index())
+            fig4 = px.line(mv_pos_time, x="season_label", y="mv_M", color="pos_label",
+                           color_discrete_map=POS_COLORS, markers=True,
+                           labels={"mv_M": "Median Market Value (€M)",
+                                   "season_label": "Season", "pos_label": "Position"},
+                           category_orders={"season_label": season_order,
+                                            "pos_label": POSITIONS})
+            fig4.update_layout(height=340, margin=dict(t=10, b=0),
+                               legend=dict(orientation="h", y=-0.3))
+            st.plotly_chart(fig4, use_container_width=True)
+
+    with st.expander("Season Summary Table", expanded=False):
+        summary = (sub3.groupby(["season_label", "league"])
+                   .agg(
+                       Players=("name", "nunique"),
+                       Median_MV=("mv_M", "median"),
+                       Avg_Goals=("goals", "mean"),
+                       Avg_xG90=("xG90", "mean"),
+                       Avg_Rating=("rating_imp", "mean"),
+                   )
+                   .round(2)
+                   .reset_index()
+                   .rename(columns={"season_label": "Season", "league": "League",
+                                    "Median_MV": "Median MV (€M)",
+                                    "Avg_Goals": "Avg Goals",
+                                    "Avg_xG90": "Avg xG/90",
+                                    "Avg_Rating": "Avg Rating"}))
+        st.dataframe(summary, hide_index=True)
+
+
+# PAGE 5: PLAYER PROFILE
+elif page == "Player Profile":
+    st.title("Player Profile")
+
+    # ── Search ──
+    def _norm(s):
+        """Lowercase and strip accents for accent-insensitive matching."""
+        return unicodedata.normalize("NFD", str(s)).encode("ascii", "ignore").decode("ascii").lower()
+
+    all_names = sorted(df["name"].dropna().unique())
+    search_query = st.text_input("Search for a player", placeholder="Type a name (accents optional)…")
+    if search_query.strip():
+        q = _norm(search_query)
+        filtered_names = [n for n in all_names if q in _norm(n)]
+    else:
+        filtered_names = all_names
+
+    if not filtered_names:
+        st.warning("No players found matching your search.")
+        st.stop()
+
+    default_idx = filtered_names.index("Mohamed Salah") if "Mohamed Salah" in filtered_names else 0
+    selected_name = st.selectbox("Select player", filtered_names, index=default_idx)
+
+    player_rows = df[df["name"] == selected_name].sort_values("season")
+    if player_rows.empty:
+        st.warning("No data found for this player.")
+        st.stop()
+
+    seasons_avail = player_rows["season"].tolist()
+    if len(seasons_avail) > 1:
+        selected_season = st.select_slider(
+            "Season",
+            options=seasons_avail,
+            value=seasons_avail[-1],
+            format_func=lambda s: SEASON_LABELS[s],
+        )
+    else:
+        selected_season = seasons_avail[0]
+
+    p = player_rows[player_rows["season"] == selected_season].iloc[0]
+    st.markdown("---")
+
+    ph_col, info_col, stats_col = st.columns([1, 2, 3])
+
+    with ph_col:
+        player_photo(p.get("image_url"), width=160)
+
+    with info_col:
+        st.markdown(f"## {p['name']}")
+        st.markdown(f"**{p['club']}** · {p['league']} · {SEASON_LABELS[selected_season]}")
+        pos_full = {"GK": "Goalkeeper", "DF": "Defender",
+                    "MF": "Midfielder", "FW": "Forward"}.get(p["pos_label"], p["pos_label"])
+        st.markdown(f"**Position:** {pos_full}")
+        st.markdown(f"**Age:** {int(p['Age']) if pd.notna(p['Age']) else 'N/A'}")
+        if pd.notna(p.get("country_of_birth")):
+            st.markdown(f"**Nationality:** {p['country_of_birth']}")
+        if pd.notna(p.get("height_in_cm")):
+            st.markdown(f"**Height:** {int(p['height_in_cm'])} cm")
+        if pd.notna(p.get("foot")):
+            st.markdown(f"**Foot:** {p['foot'].capitalize()}")
+        st.markdown(f"📊 **Team finishing position:** {int(p['team_finishing_pos']) if pd.notna(p['team_finishing_pos']) else 'N/A'}")
+
+    with stats_col:
+        st.markdown("### Season Statistics")
+        st.metric("Market Value", fmt_euros(p["market_value_end"]))
+
+        m2, m3, m4, m5 = st.columns(4)
+        m2.metric("Appearances", int(p["appearances"]) if pd.notna(p["appearances"]) else "N/A")
+        m3.metric("Goals", int(p["goals"]) if pd.notna(p["goals"]) else "N/A")
+        m4.metric("Assists", int(p["assists"]) if pd.notna(p["assists"]) else "N/A")
+        m5.metric("Rating", f"{p['rating_imp']:.2f}" if pd.notna(p.get("rating_imp")) else "N/A")
+
+        m6, m7, m8, _ = st.columns(4)
+        m6.metric("xG / 90", f"{p['xG90']:.2f}" if pd.notna(p.get("xG90")) else "N/A")
+        m7.metric("xA / 90", f"{p['xA90']:.2f}" if pd.notna(p.get("xA90")) else "N/A")
+        m8.metric("Minutes", f"{int(p['minutes']):,}" if pd.notna(p.get("minutes")) else "N/A")
+
+        # Position-specific metrics
+        if p["pos_label"] == "GK":
+            gk_row = p
+            gk_note = ""
+            if pd.isna(p.get("gk_clean_sheet_pct")):
+                fallback = player_rows.dropna(subset=["gk_clean_sheet_pct"])
+                if not fallback.empty:
+                    gk_row = fallback.iloc[-1]
+                    gk_note = f" *(from {gk_row['season_label']})*"
+            g1, g2, g3 = st.columns(3)
+            g1.metric("Clean Sheet %", f"{gk_row['gk_clean_sheet_pct']*100:.1f}%{gk_note}" if pd.notna(gk_row.get("gk_clean_sheet_pct")) else "N/A")
+            g2.metric("Goals Conceded/90", f"{gk_row['gk_goals_conceded_per90']:.2f}{gk_note}" if pd.notna(gk_row.get("gk_goals_conceded_per90")) else "N/A")
+            g3.metric("Win Rate", f"{gk_row['gk_win_rate']*100:.1f}%{gk_note}" if pd.notna(gk_row.get("gk_win_rate")) else "N/A")
+        elif p["pos_label"] == "DF":
+            df_row = p
+            df_note = ""
+            if pd.isna(p.get("def_clean_sheet_pct")):
+                fallback = player_rows.dropna(subset=["def_clean_sheet_pct"])
+                if not fallback.empty:
+                    df_row = fallback.iloc[-1]
+                    df_note = f" *(from {df_row['season_label']})*"
+            d1, d2, d3 = st.columns(3)
+            d1.metric("Clean Sheet %", f"{df_row['def_clean_sheet_pct']*100:.1f}%{df_note}" if pd.notna(df_row.get("def_clean_sheet_pct")) else "N/A")
+            d2.metric("Goals Conceded/90", f"{df_row['def_goals_conceded_per90']:.2f}{df_note}" if pd.notna(df_row.get("def_goals_conceded_per90")) else "N/A")
+            d3.metric("xG Buildup/90", f"{p['xGBuildup90']:.2f}" if pd.notna(p.get("xGBuildup90")) else "N/A")
+
+    # Career trend
+    if len(seasons_avail) > 1:
+        STAT_LABELS = {
+            "goals": "Goals", "assists": "Assists", "xG90": "xG/90",
+            "xA90": "xA/90", "appearances": "Appearances",
+            "gk_clean_sheet_pct": "Clean Sheet %", "gk_goals_conceded_per90": "Goals Conceded/90",
+            "gk_win_rate": "Win Rate",
+            "def_clean_sheet_pct": "Clean Sheet %", "def_goals_conceded_per90": "Goals Conceded/90",
+        }
+
+        base_trend_cols = ["season_label", "goals", "assists", "xG90", "xA90", "appearances"]
+        base_options    = ["goals", "assists", "xG90", "xA90", "appearances"]
+        default_options = ["goals", "assists", "xG90", "xA90"]
+
+        pos_label = player_rows.iloc[0]["pos_label"]
+        if pos_label == "GK":
+            base_trend_cols += ["gk_clean_sheet_pct", "gk_goals_conceded_per90", "gk_win_rate"]
+            base_options    += ["gk_clean_sheet_pct", "gk_goals_conceded_per90", "gk_win_rate"]
+            default_options  = ["gk_clean_sheet_pct", "gk_win_rate", "appearances"]
+        elif pos_label == "DF":
+            base_trend_cols += ["def_clean_sheet_pct", "def_goals_conceded_per90"]
+            base_options    += ["def_clean_sheet_pct", "def_goals_conceded_per90"]
+            default_options  = ["goals", "assists", "def_clean_sheet_pct"]
+
+        avail    = [c for c in base_trend_cols if c in player_rows.columns]
+        trend_df = player_rows[avail + ["mv_M", "rating_imp"]].copy() if "mv_M" in player_rows.columns else player_rows[avail].copy()
+
+        # Scale percentage columns (stored as fractions 0-1) for display
+        for pct_col in ["gk_clean_sheet_pct", "gk_win_rate", "def_clean_sheet_pct"]:
+            if pct_col in trend_df.columns:
+                trend_df[pct_col] = trend_df[pct_col] * 100
+
+        sel_lbl = SEASON_LABELS[selected_season]
+
+        def _add_season_line(fig):
+            """Dotted vertical line marking the currently selected season."""
+            fig.add_shape(
+                type="line", xref="x", yref="paper",
+                x0=sel_lbl, x1=sel_lbl, y0=0, y1=1,
+                line=dict(dash="dot", color="rgba(255,255,255,0.5)", width=1.5),
+            )
+            fig.add_annotation(
+                x=sel_lbl, yref="paper", y=1.02,
+                text="Selected", showarrow=False,
+                font=dict(color="rgba(255,255,255,0.7)", size=11),
+            )
+
+        # Performance stats chart
+        with st.expander(f" {selected_name}: Performance Trend", expanded=True):
+            chart_choice = st.multiselect(
+                "Select statistics to plot",
+                [o for o in base_options if o in avail],
+                default=[o for o in default_options if o in avail],
+                format_func=lambda x: STAT_LABELS.get(x, x),
+            )
+            if chart_choice:
+                fig_trend = go.Figure()
+                palette = px.colors.qualitative.Set2
+                for i, stat in enumerate(chart_choice):
+                    if stat in trend_df.columns:
+                        fig_trend.add_trace(go.Scatter(
+                            x=trend_df["season_label"], y=trend_df[stat],
+                            mode="lines+markers", name=STAT_LABELS.get(stat, stat),
+                            line=dict(color=palette[i % len(palette)], width=3),
+                            marker=dict(size=9),
+                        ))
+                fig_trend.update_layout(
+                    height=320, margin=dict(t=10, b=0),
+                    xaxis_title="Season",
+                    legend=dict(orientation="h", y=-0.25),
+                )
+                _add_season_line(fig_trend)
+                st.plotly_chart(fig_trend, use_container_width=True)
+
+        # Market value chart
+        with st.expander(f"{selected_name}: Market Value over Time", expanded=True):
+            if "mv_M" in trend_df.columns and trend_df["mv_M"].notna().any():
+                fig_mv = go.Figure()
+                fig_mv.add_trace(go.Scatter(
+                    x=trend_df["season_label"], y=trend_df["mv_M"],
+                    mode="lines+markers", name="Market Value (€M)",
+                    line=dict(color="#e67e22", width=3),
+                    marker=dict(size=9),
+                ))
+                fig_mv.update_layout(
+                    height=280, margin=dict(t=10, b=0),
+                    xaxis_title="Season", yaxis_title="Market Value (€M)",
+                    legend=dict(orientation="h", y=-0.3),
+                )
+                _add_season_line(fig_mv)
+                st.plotly_chart(fig_mv, use_container_width=True)
+            else:
+                st.info("No market value data available for this player.")
+
+        # Rating chart
+        with st.expander(f" {selected_name}: Average Rating over Time", expanded=True):
+            if "rating_imp" in trend_df.columns and trend_df["rating_imp"].notna().any():
+                fig_rt = go.Figure()
+                fig_rt.add_trace(go.Scatter(
+                    x=trend_df["season_label"], y=trend_df["rating_imp"],
+                    mode="lines+markers", name="Player Rating",
+                    line=dict(color="#2ecc71", width=3),
+                    marker=dict(size=9),
+                ))
+                fig_rt.update_layout(
+                    height=280, margin=dict(t=10, b=0),
+                    xaxis_title="Season", yaxis_title="Player Rating",
+                    yaxis=dict(range=[5.5, 8.5]),
+                    legend=dict(orientation="h", y=-0.3),
+                )
+                _add_season_line(fig_rt)
+                st.plotly_chart(fig_rt, use_container_width=True)
+            else:
+                st.info("No rating data available for this player.")
+
+        with st.expander("View full career data table", expanded=False):
+            career_show = player_rows[["season_label", "league", "club",
+                                        "Age", "appearances", "goals", "assists",
+                                        "xG90", "xA90", "rating_imp", "mv_M"]].copy()
+            career_show.columns = ["Season", "League", "Club", "Age",
+                                   "Apps", "Goals", "Assists",
+                                   "xG/90", "xA/90", "Rating", "MV (€M)"]
+            career_show = career_show.round(2)
+            st.dataframe(career_show.reset_index(drop=True), hide_index=True)
+    else:
+        st.info(f"Only one season of data available for {selected_name}.")
+
+    # Similar players
+    st.markdown(
+        """
+        **How similarity is calculated:** Each player-season is described by a set of performance
+        statistics (age, goals per 90, assists per 90, expected goals, expected assists, xG chain,
+        xG buildup, player rating, minutes played, and team finishing position). These figures are
+        standardised so that no single stat dominates, then compared using cosine similarity, a
+        measure of how closely two players' statistical profiles point in the same direction.
+        A score of 100% means the profiles are identical; lower scores reflect increasing differences
+        in playing style or output. Only players from the same position are considered by default.
+        """
+    )
+    with st.expander(" Find Similar Players", expanded=True):
+        sim_col1, sim_col2, sim_col3 = st.columns(3)
+        with sim_col1:
+            same_pos_only = st.checkbox("Same position only", value=True)
+        with sim_col2:
+            same_season_only = st.checkbox("Same season only", value=True)
+        with sim_col3:
+            n_similar = st.slider("Number of similar players", 3, 10, 5)
+
+        # Build pool
+        sim_pool = df.copy()
+        if same_season_only:
+            sim_pool = sim_pool[sim_pool["season"] == selected_season]
+
+        player_in_pool = sim_pool[sim_pool["name"] == selected_name]
+        if len(player_in_pool) == 0:
+            st.warning("Player not found in pool for similarity search.")
+        else:
+            sim_pool_reset = sim_pool.reset_index(drop=True)
+            p_idx_reset = sim_pool_reset[sim_pool_reset["name"] == selected_name].index[0]
+
+            similar = find_similar_players(
+                sim_pool_reset, p_idx_reset,
+                top_n=n_similar, same_pos=same_pos_only
+            )
+
+            if similar.empty:
+                st.info("No similar players found with current filters.")
+            else:
+                st.markdown(f"**Most similar players to {selected_name}** "
+                            f"({'same position, ' if same_pos_only else ''}"
+                            f"{'same season' if same_season_only else 'all seasons'})")
+
+                # Show as cards
+                ncols = min(n_similar, 5)
+                sim_cols = st.columns(ncols)
+                for i, (_, row) in enumerate(similar.head(ncols).iterrows()):
+                    with sim_cols[i]:
+                        player_photo(row.get("image_url"), width=100)
+                        st.markdown(f"**{row['name']}**")
+                        st.caption(f"{row['pos_label']} · {row['club']}")
+                        st.caption(f"{row['league']} · {SEASON_LABELS.get(row['season'], row['season'])}")
+                        st.caption(f"Age {int(row['Age']) if pd.notna(row['Age']) else '?'} · "
+                                   f" {int(row['goals']) if pd.notna(row['goals']) else '?'} "
+                                   f" {int(row['assists']) if pd.notna(row['assists']) else '?'}")
+                        st.caption(f"MV: {fmt_euros(row['market_value_end'])}")
+                        sim_pct = int(row["Similarity"] * 100)
+                        st.progress(sim_pct / 100, text=f"{sim_pct}% similar")
+
+                # Second row if more than 5
+                if n_similar > 5 and len(similar) > 5:
+                    sim_cols2 = st.columns(min(n_similar - 5, 5))
+                    for i, (_, row) in enumerate(similar.iloc[5:].iterrows()):
+                        with sim_cols2[i]:
+                            player_photo(row.get("image_url"), width=100)
+                            st.markdown(f"**{row['name']}**")
+                            st.caption(f"{row['pos_label']} · {row['club']}")
+                            st.caption(f"{row['league']} · {SEASON_LABELS.get(row['season'], row['season'])}")
+                            st.caption(f"Age {int(row['Age']) if pd.notna(row['Age']) else '?'} · "
+                                       f" {int(row['goals']) if pd.notna(row['goals']) else '?'} "
+                                       f" {int(row['assists']) if pd.notna(row['assists']) else '?'}")
+                            st.caption(f"MV: {fmt_euros(row['market_value_end'])}")
+                            sim_pct = int(row["Similarity"] * 100)
+                            st.progress(sim_pct / 100, text=f"{sim_pct}% similar")
+
+                with st.expander("View full similarity table", expanded=False):
+                    show_sim = similar[["name", "pos_label", "club", "league",
+                                         "season", "Age", "goals", "assists",
+                                         "rating_imp", "Market Value", "Similarity"]].copy()
+                    show_sim["season"] = show_sim["season"].map(SEASON_LABELS)
+                    show_sim["Similarity"] = show_sim["Similarity"].round(3)
+                    show_sim["rating_imp"] = show_sim["rating_imp"].round(2)
+                    show_sim = show_sim.rename(columns={
+                        "name": "Player", "pos_label": "Pos", "club": "Club",
+                        "league": "League", "season": "Season", "Age": "Age",
+                        "goals": "Goals", "assists": "Assists",
+                        "rating_imp": "Rating", "Similarity": "Cosine Similarity",
+                    })
+                    st.dataframe(show_sim.reset_index(drop=True), hide_index=True)
+
+
+# PAGE 6: MARKET VALUE INSIGHTS
+elif page == "Market Value Insights":
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from matplotlib.offsetbox import OffsetImage, AnnotationBbox, TextArea, HPacker
+    from urllib.request import urlopen
+    from PIL import Image as PILImage
+
+    st.title("Market Value Insights")
+    st.markdown("Explore top players by highest career market value, and which players rose or fell the most year-on-year.")
+
+    LEAGUE_IDS = {
+        "Premier League": "GB1",
+        "La Liga":        "ES1",
+        "Bundesliga":     "L1",
+        "Serie A":        "IT1",
+        "Ligue 1":        "FR1",
+    }
+    YEARS = [2021, 2022, 2023, 2024]
+
+    @st.cache_data
+    def load_transfermarkt():
+        base = os.path.dirname(__file__)
+        players_path = os.path.join(base, "..", "data", "raw", "player_scores", "players_big5_filtered.csv")
+        vals_path    = os.path.join(base, "..", "data", "raw", "player_scores", "player_valuations_big5_filtered.csv")
+        tm_players = pd.read_csv(players_path, low_memory=False)
+        tm_vals    = pd.read_csv(vals_path, low_memory=False)
+        tm_vals["date"] = pd.to_datetime(tm_vals["date"])
+        tm_vals["year"] = tm_vals["date"].dt.year
+        return tm_players, tm_vals
+
+    @st.cache_resource
+    def fetch_img(url):
+        """Download and cache a player photo as an RGB PIL image."""
+        try:
+            with urlopen(url, timeout=10) as r:
+                img = PILImage.open(r).copy()
+                return img.convert("RGB")
+        except Exception:
+            return None
+
+    @st.cache_data
+    def get_yearly_deltas(league_id):
+        league_vals = tm_vals[tm_vals["player_club_domestic_competition_id"] == league_id].copy()
+        yearly = (
+            league_vals.sort_values("date")
+            .groupby(["player_id", "year"])["market_value_in_eur"]
+            .last().reset_index().sort_values(["player_id", "year"])
+        )
+        yearly["delta_eur"]      = yearly.groupby("player_id")["market_value_in_eur"].diff()
+        yearly["delta_millions"] = yearly["delta_eur"] / 1e6
+        yearly = yearly.merge(tm_players[["player_id", "name", "image_url"]], on="player_id", how="left")
+        return yearly[yearly["year"].between(2021, 2024)].dropna(subset=["delta_millions"])
+
+    tm_players, tm_vals = load_transfermarkt()
+
+    # Section 1: Top 5 by Highest Market Value
+    with st.expander("Top Players by Highest Career Market Value", expanded=True):
+        positions_avail = sorted(tm_players[tm_players["position"] != "Missing"]["position"].unique())
+        sel_pos = st.selectbox("Select position", positions_avail,
+                               index=positions_avail.index("Attack") if "Attack" in positions_avail else 0)
+
+        pos_df = (
+            tm_players[tm_players["position"] == sel_pos]
+            .dropna(subset=["highest_market_value_in_eur"])
+            # Keep only one row per player (drop duplicate player_id entries)
+            .drop_duplicates(subset=["player_id"])
+            .sort_values("highest_market_value_in_eur", ascending=False)
+            .copy()
+        )
+        cutoff = pos_df.iloc[4]["highest_market_value_in_eur"] if len(pos_df) >= 5 else 0
+        top5   = pos_df[pos_df["highest_market_value_in_eur"] >= cutoff].reset_index(drop=True)
+
+        np.random.seed(42)
+        pos_df["x"] = np.random.normal(0, 0.08, len(pos_df))
+        top5["x"]   = np.random.normal(0, 0.08, len(top5))
+        colors_tab  = plt.cm.tab10.colors
+
+        with st.spinner("Loading player photos…"):
+            fig_t5, ax_t5 = plt.subplots(figsize=(10, 6))
+            ax_t5.scatter(pos_df["x"], pos_df["highest_market_value_in_eur"] / 1e6,
+                          alpha=0.25, s=20, label="All Players")
+            ax_t5.scatter(top5["x"], top5["highest_market_value_in_eur"] / 1e6,
+                          color="red", s=50, zorder=5, label="Top 5 (incl. ties)")
+
+            y_max = pos_df["highest_market_value_in_eur"].max() / 1e6
+            ax_t5.set_ylim(0, y_max * 1.1)
+            x_min, x_max = ax_t5.get_xlim()
+            margin   = (x_max - x_min) * 0.55
+            x_right  = x_max + margin * 0.08
+            ax_t5.set_xlim(x_min, x_max + margin)
+            y_lim_max = ax_t5.get_ylim()[1]
+            spacing   = y_lim_max / (len(top5) + 1)
+
+            for i, row in top5.iterrows():
+                y_val    = row["highest_market_value_in_eur"] / 1e6
+                y_pos    = y_lim_max - (i + 1) * spacing
+                img      = fetch_img(row["image_url"]) if pd.notna(row.get("image_url")) else None
+                label    = f"{row['name']}\n€{y_val:.0f}M"
+                text_box = TextArea(label, textprops=dict(color="black", fontsize=8, weight="bold"))
+                if img:
+                    imagebox  = OffsetImage(img, zoom=0.22)
+                    label_box = HPacker(children=[imagebox, text_box], align="center", pad=0, sep=4)
+                else:
+                    label_box = text_box
+                ab = AnnotationBbox(label_box, (x_right, y_pos), xycoords="data",
+                                    box_alignment=(0, 0.5), frameon=False)
+                ax_t5.add_artist(ab)
+                ax_t5.annotate("", xy=(row["x"], y_val), xytext=(x_right, y_pos),
+                               arrowprops=dict(arrowstyle="->", lw=1.5,
+                                               color=colors_tab[i % len(colors_tab)],
+                                               shrinkA=0, shrinkB=5))
+            ax_t5.legend(loc="upper left")
+            ax_t5.set_title(f"{sel_pos}: Top 5 Players by Highest Career Market Value (incl. ties)")
+            ax_t5.tick_params(axis="x", which="both", bottom=False, labelbottom=False)
+            ax_t5.set_xlabel("Players (jittered)")
+            ax_t5.set_ylabel("Market Value (€M)")
+            plt.tight_layout()
+            st.pyplot(fig_t5)
+            plt.close(fig_t5)
+
+    # Section 2: Risers
+    with st.expander("Market Value Risers", expanded=False):
+        r_col1, r_col2 = st.columns(2)
+        with r_col1:
+            league_r = st.selectbox("League", list(LEAGUE_IDS.keys()), key="risers_league")
+        with r_col2:
+            year_r = st.selectbox("Year", YEARS, index=len(YEARS) - 1, key="risers_year",
+                                   format_func=lambda y: f"{y-1}–{y}")
+
+        deltas_r = get_yearly_deltas(LEAGUE_IDS[league_r])
+        sub_r    = deltas_r[deltas_r["year"] == year_r].nlargest(10, "delta_millions").reset_index(drop=True)
+
+        with st.spinner("Loading risers chart…"):
+            fig_r, ax_r = plt.subplots(figsize=(10, 7))
+            max_val = sub_r["delta_millions"].max()
+            sub_r["name_wrapped"] = sub_r["name"].apply(lambda x: x.replace(" ", "\n", 1))
+            sns.barplot(data=sub_r, x="delta_millions", y="name_wrapped", palette="Greens_d", ax=ax_r)
+            ax_r.set_xlim(-max_val * 0.14, max_val * 1.05)
+            ax_r.set_title(f"{league_r}: Top 10 Biggest Risers ({year_r-1} to {year_r})", fontsize=13)
+            ax_r.set_xlabel("Increase (€M)")
+            ax_r.set_ylabel("")
+            photo_x   = -max_val * 0.07
+            for i, row in sub_r.iterrows():
+                img = fetch_img(row["image_url"]) if pd.notna(row.get("image_url")) else None
+                if img:
+                    ab = AnnotationBbox(OffsetImage(img, zoom=0.22), (photo_x, i),
+                                        xycoords="data", box_alignment=(1, 0.5), frameon=False)
+                    ax_r.add_artist(ab)
+            plt.tight_layout()
+            st.pyplot(fig_r)
+            plt.close(fig_r)
+
+    # ── Section 3: Fallers ────────────────────────────────────────────
+    with st.expander("Market Value Fallers", expanded=False):
+        f_col1, f_col2 = st.columns(2)
+        with f_col1:
+            league_f = st.selectbox("League", list(LEAGUE_IDS.keys()), key="fallers_league")
+        with f_col2:
+            year_f = st.selectbox("Year", YEARS, index=len(YEARS) - 1, key="fallers_year",
+                                   format_func=lambda y: f"{y-1}–{y}")
+
+        deltas_f = get_yearly_deltas(LEAGUE_IDS[league_f])
+        sub_f    = deltas_f[deltas_f["year"] == year_f].nsmallest(10, "delta_millions").reset_index(drop=True)
+
+        with st.spinner("Loading fallers chart…"):
+            fig_f, ax_f = plt.subplots(figsize=(10, 7))
+            min_val = sub_f["delta_millions"].min()
+            sub_f["name_wrapped"] = sub_f["name"].apply(lambda x: x.replace(" ", "\n", 1))
+            sns.barplot(data=sub_f, x="delta_millions", y="name_wrapped", palette="Reds_d", ax=ax_f)
+            ax_f.set_xlim(min_val * 1.14, -min_val * 0.18)
+            ax_f.set_title(f"{league_f}: Top 10 Biggest Fallers ({year_f-1} to {year_f})", fontsize=13)
+            ax_f.set_xlabel("Decrease (€M)")
+            ax_f.set_ylabel("")
+            photo_x = -min_val * 0.02
+            for i, row in sub_f.iterrows():
+                img = fetch_img(row["image_url"]) if pd.notna(row.get("image_url")) else None
+                if img:
+                    ab = AnnotationBbox(OffsetImage(img, zoom=0.22), (photo_x, i),
+                                        xycoords="data", box_alignment=(0, 0.5), frameon=False)
+                    ax_f.add_artist(ab)
+            plt.tight_layout()
+            st.pyplot(fig_f)
+            plt.close(fig_f)
+
+
+# PAGE 7: VALUE ESTIMATOR
+elif page == "Value Estimator":
+    st.title("Player Value Estimator")
+    st.markdown(
+        "Enter a hypothetical player's attributes and in-season statistics. "
+        "The model, a Ridge regression trained on all five leagues and five seasons, "
+        "will estimate their market value and find the most similar real player-season."
+    )
+    st.markdown("---")
+
+    POS_FULL = {"GK": "Goalkeeper", "DF": "Defender", "MF": "Midfielder", "FW": "Forward"}
+
+    # Position defaults
+    pos_med_df = df.groupby("pos_label")[ESTIMATOR_FEATS].median()
+
+    left, right = st.columns([1, 1])
+
+    # LEFT: input form
+    with left:
+        with st.expander("Player Profile", expanded=True):
+            inp_pos = st.selectbox("Position", POSITIONS,
+                                   format_func=lambda x: POS_FULL[x])
+            inp_league = st.selectbox("League", LEAGUES)
+            inp_age = st.slider("Age", 16, 40, 23)
+
+        with st.expander("Season Stats", expanded=True):
+            inp_apps = st.number_input("Appearances", 0, 50, 25, step=1)
+            inp_min  = st.number_input("Minutes Played", 0, 4500,
+                                       min(int(inp_apps * 75), 4500), step=10)
+            inp_goals   = st.number_input("Goals",   0, 60, 0, step=1)
+            inp_assists = st.number_input("Assists", 0, 40, 0, step=1)
+            inp_team_pos = st.slider("Team Finishing Position", 1, 20, 10)
+
+        with st.expander("Advanced Stats", expanded=True):
+            pm = pos_med_df.loc[inp_pos] if inp_pos in pos_med_df.index else pos_med_df.mean()
+            inp_xg90       = st.slider("xG per 90",         0.00, 1.50,
+                                       round(float(pm.get("xG90", 0.10)), 2), step=0.01)
+            inp_xa90       = st.slider("xA per 90",         0.00, 1.00,
+                                       round(float(pm.get("xA90", 0.05)), 2), step=0.01)
+            inp_xgchain90  = st.slider("xG Chain per 90",   0.00, 1.50,
+                                       round(float(pm.get("xGChain90", 0.30)), 2), step=0.01)
+            inp_xgbuildup90= st.slider("xG Buildup per 90", 0.00, 1.00,
+                                       round(float(pm.get("xGBuildup90", 0.10)), 2), step=0.01)
+            inp_rating     = st.slider("Player Rating",     5.0, 10.0,
+                                       round(float(pm.get("rating_imp", 6.8)), 1), step=0.1)
+
+    # Derived per-90 stats
+    mins_90   = max(inp_min / 90, 0.01)
+    gls_90    = inp_goals   / mins_90
+    ast_90    = inp_assists / mins_90
+    pos_enc_v = POSITIONS.index(inp_pos)
+    lg_enc_v  = LEAGUES.index(inp_league)
+
+    # Feature vector
+    x_vec = np.array([[
+        inp_age, inp_age ** 2, pos_enc_v, lg_enc_v,
+        gls_90, ast_90, inp_xg90, inp_xa90, inp_xgchain90, inp_xgbuildup90,
+        inp_rating, inp_min, inp_apps, inp_team_pos,
+    ]], dtype=float)
+
+    x_norm    = (x_vec - _mu) / _sig
+    x_bias    = np.c_[np.ones(1), x_norm]
+    log_pred  = float(x_bias @ _w)
+    mv_point  = np.expm1(log_pred)
+    mv_low    = np.expm1(log_pred - _rmse)
+    mv_high   = np.expm1(log_pred + _rmse)
+
+    # RIGHT: results
+    with right:
+        with st.expander("Estimated Market Value", expanded=True):
+            st.markdown(f"## {fmt_euros(mv_point)}")
+            st.markdown(f"**Estimated range:** {fmt_euros(mv_low)} to {fmt_euros(mv_high)}")
+            st.caption(
+                "Point estimate from Ridge regression (λ=10) trained on all player-seasons. "
+                f"Range represents ±1 RMSE ({_rmse:.3f} in log scale), covering roughly a 68% confidence band."
+            )
+
+            # Visual gauge bar
+            low_m  = mv_low  / 1e6
+            mid_m  = mv_point / 1e6
+            high_m = mv_high / 1e6
+            gauge = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=round(mid_m, 1),
+                number={"suffix": "M", "prefix": "€", "font": {"size": 28}},
+                gauge={
+                    "axis": {"range": [0, max(high_m * 1.2, 1)], "ticksuffix": "M"},
+                    "bar": {"color": "#e15759"},
+                    "steps": [
+                        {"range": [0, low_m],           "color": "#2a2a2a"},
+                        {"range": [low_m, high_m],      "color": "#444"},
+                        {"range": [high_m, max(high_m * 1.2, 1)], "color": "#2a2a2a"},
+                    ],
+                    "threshold": {
+                        "line": {"color": "white", "width": 2},
+                        "thickness": 0.75,
+                        "value": round(mid_m, 1),
+                    },
+                },
+            ))
+            gauge.update_layout(height=220, margin=dict(t=20, b=0, l=20, r=20))
+            st.plotly_chart(gauge, use_container_width=True)
+
+        # Similar real player-season
+        with st.expander("🔍 Most Similar Real Player-Season", expanded=True):
+            SIM_E_FEATS = ["Age", "Gls_90", "Ast_90", "xG90", "xA90",
+                           "xGChain90", "xGBuildup90", "rating_imp",
+                           "minutes", "team_finishing_pos"]
+
+            sim_pool = df[df["pos_label"] == inp_pos].copy()
+            for c in SIM_E_FEATS:
+                sim_pool[c] = sim_pool[c].fillna(sim_pool[c].median())
+
+            X_pool = sim_pool[SIM_E_FEATS].values.astype(float)
+            mu_s   = X_pool.mean(0); sig_s = X_pool.std(0) + 1e-9
+            X_pool_n = (X_pool - mu_s) / sig_s
+
+            q_vec = np.array([[
+                inp_age, gls_90, ast_90, inp_xg90, inp_xa90,
+                inp_xgchain90, inp_xgbuildup90, inp_rating,
+                inp_min, inp_team_pos,
+            ]], dtype=float)
+            q_norm = (q_vec - mu_s) / sig_s
+
+            sims    = cosine_similarity_matrix(q_norm, X_pool_n)[0]
+            best_i  = int(np.argmax(sims))
+            best    = sim_pool.iloc[best_i]
+            sim_pct = int(sims[best_i] * 100)
+
+            sc1, sc2 = st.columns([1, 2])
+            with sc1:
+                player_photo(best.get("image_url"), width=110)
+            with sc2:
+                st.markdown(f"**{best['name']}**")
+                st.caption(
+                    f"{POS_FULL.get(best['pos_label'], best['pos_label'])} · "
+                    f"{best['club']} · {best['league']}"
+                )
+                st.caption(
+                    f"{SEASON_LABELS.get(best['season'], best['season'])} · "
+                    f"Age {int(best['Age']) if pd.notna(best['Age']) else '?'}"
+                )
+                st.caption(
+                    f"{int(best['goals'])} goals · "
+                    f"{int(best['assists'])} assists · "
+                    f"{int(best['minutes']):,} mins"
+                )
+                st.caption(f"Actual Market Value: **{fmt_euros(best['market_value_end'])}**")
+                st.progress(sim_pct / 100, text=f"{sim_pct}% profile match")
+
+        # Top 5 similar seasons
+        with st.expander("📋 Top 5 Similar Player-Seasons", expanded=False):
+            top5_idx = np.argsort(sims)[::-1][:5]
+            rows = []
+            for idx in top5_idx:
+                r = sim_pool.iloc[idx]
+                rows.append({
+                    "Player":        r["name"],
+                    "Club":          r["club"],
+                    "League":        r["league"],
+                    "Season":        SEASON_LABELS.get(r["season"], r["season"]),
+                    "Age":           int(r["Age"]) if pd.notna(r["Age"]) else "?",
+                    "Goals":         int(r["goals"]),
+                    "Assists":       int(r["assists"]),
+                    "Market Value":  fmt_euros(r["market_value_end"]),
+                    "Similarity %":  int(sims[idx] * 100),
+                })
+            st.dataframe(pd.DataFrame(rows), hide_index=True)

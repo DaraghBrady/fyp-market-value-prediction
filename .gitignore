@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+venv/
+.venv/
+
+# Data – raw files (large, not needed by app)
+data/raw/game_lineups.csv
+data/raw/club_games.csv
+data/raw/appearances.csv
+data/raw/games.csv
+data/raw/competitions.csv
+data/raw/clubs.csv
+data/raw/player_valuations.csv
+data/raw/player_scores/player_scores.csv
+
+# Notebooks outputs (optional – remove line if you want to include them)
+outputs/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
