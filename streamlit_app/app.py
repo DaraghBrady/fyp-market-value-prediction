@@ -1155,7 +1155,7 @@ elif page == "Value Estimator":
 
     x_norm    = (x_vec - _mu) / _sig
     x_bias    = np.c_[np.ones(1), x_norm]
-    log_pred  = float(x_bias @ _w)
+    log_pred  = float((x_bias @ _w).item())
     mv_point  = np.expm1(log_pred)
     mv_low    = np.expm1(log_pred - _rmse)
     mv_high   = np.expm1(log_pred + _rmse)
